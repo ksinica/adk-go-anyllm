@@ -8,9 +8,9 @@ import (
 func TestNewRequiresProvider(t *testing.T) {
 	t.Parallel()
 
-	_, err := New()
+	_, err := New(nil)
 	if err == nil {
-		t.Fatal("expected error for missing provider")
+		t.Fatal("expected error for nil provider")
 	}
 	var adapterErr *AdapterError
 	if !errors.As(err, &adapterErr) {
@@ -22,7 +22,7 @@ func TestNewWithProviderAndModel(t *testing.T) {
 	t.Parallel()
 
 	m, err := New(
-		WithProvider(&fakeProvider{}),
+		&fakeProvider{},
 		WithModel("gpt-4o-mini"),
 		WithExtra(map[string]any{"foo": "bar"}),
 	)
@@ -37,24 +37,11 @@ func TestNewWithProviderAndModel(t *testing.T) {
 	}
 }
 
-func TestWithProviderRejectsNil(t *testing.T) {
-	t.Parallel()
-
-	_, err := New(WithProvider(nil))
-	if err == nil {
-		t.Fatal("expected error for nil provider")
-	}
-	var adapterErr *AdapterError
-	if !errors.As(err, &adapterErr) {
-		t.Fatalf("expected *AdapterError, got %T", err)
-	}
-}
-
 func TestWithExtraNilClearsExtra(t *testing.T) {
 	t.Parallel()
 
 	m, err := New(
-		WithProvider(&fakeProvider{}),
+		&fakeProvider{},
 		WithExtra(map[string]any{"foo": "bar"}),
 		WithExtra(nil),
 	)
@@ -70,7 +57,7 @@ func TestNewSkipsNilOption(t *testing.T) {
 	t.Parallel()
 
 	m, err := New(
-		WithProvider(&fakeProvider{}),
+		&fakeProvider{},
 		nil,
 		WithModel("gpt-test"),
 	)

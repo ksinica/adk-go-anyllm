@@ -4,31 +4,14 @@ package adkanyllm
 
 import (
 	"maps"
-
-	anyllm "github.com/mozilla-ai/any-llm-go"
 )
 
 // Option configures a Model.
 type Option func(*config) error
 
 type config struct {
-	provider anyllm.Provider
-	extra    map[string]any
-	model    string
-}
-
-// WithProvider sets the AnyLLM provider used for completions.
-//
-// This option is required.
-func WithProvider(provider anyllm.Provider) Option {
-	return func(c *config) error {
-		if provider == nil {
-			return newError("provider is required")
-		}
-
-		c.provider = provider
-		return nil
-	}
+	extra map[string]any
+	model string
 }
 
 // WithModel sets the default model name used when LLMRequest.Model is empty.
@@ -50,12 +33,4 @@ func WithExtra(extra map[string]any) Option {
 		c.extra = maps.Clone(extra)
 		return nil
 	}
-}
-
-func (c *config) validate() error {
-	if c.provider == nil {
-		return newError("provider is required")
-	}
-
-	return nil
 }

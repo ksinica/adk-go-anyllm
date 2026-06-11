@@ -14,7 +14,7 @@ func TestModelGenerateContentOnce(t *testing.T) {
 	t.Parallel()
 
 	m, err := New(
-		WithProvider(&fakeProvider{}),
+		&fakeProvider{},
 		WithModel("gpt-test"),
 	)
 	if err != nil {
@@ -46,7 +46,7 @@ func TestModelGenerateContentOnce(t *testing.T) {
 func TestGenerateContentNilRequest(t *testing.T) {
 	t.Parallel()
 
-	m, err := New(WithProvider(&fakeProvider{}))
+	m, err := New(&fakeProvider{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestGenerateContentUnsupportedFeature(t *testing.T) {
 	t.Parallel()
 
 	m, err := New(
-		WithProvider(&fakeProvider{}),
+		&fakeProvider{},
 		WithModel("gpt-test"),
 	)
 	if err != nil {
@@ -117,7 +117,7 @@ func TestGenerateContentUsesDefaultModel(t *testing.T) {
 
 	var capturedModel string
 	m, err := New(
-		WithProvider(&fakeProvider{
+		&fakeProvider{
 			completionFn: func(_ context.Context, params anyllm.CompletionParams) (*anyllm.ChatCompletion, error) {
 				capturedModel = params.Model
 				return &anyllm.ChatCompletion{
@@ -127,7 +127,7 @@ func TestGenerateContentUsesDefaultModel(t *testing.T) {
 					}},
 				}, nil
 			},
-		}),
+		},
 		WithModel("default-model"),
 	)
 	if err != nil {
@@ -152,11 +152,11 @@ func TestGenerateContentPropagatesProviderError(t *testing.T) {
 	t.Parallel()
 
 	wantErr := errors.New("provider down")
-	m, err := New(WithProvider(&fakeProvider{
+	m, err := New(&fakeProvider{
 		completionFn: func(_ context.Context, _ anyllm.CompletionParams) (*anyllm.ChatCompletion, error) {
 			return nil, wantErr
 		},
-	}))
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestGenerateContentPropagatesExtra(t *testing.T) {
 
 	var capturedExtra map[string]any
 	m, err := New(
-		WithProvider(&fakeProvider{
+		&fakeProvider{
 			completionFn: func(_ context.Context, params anyllm.CompletionParams) (*anyllm.ChatCompletion, error) {
 				capturedExtra = params.Extra
 				return &anyllm.ChatCompletion{
@@ -190,7 +190,7 @@ func TestGenerateContentPropagatesExtra(t *testing.T) {
 					}},
 				}, nil
 			},
-		}),
+		},
 		WithModel("gpt-test"),
 		WithExtra(map[string]any{"foo": "bar"}),
 	)

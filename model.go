@@ -19,7 +19,12 @@ type Model struct {
 }
 
 // New constructs a new ADK-compatible AnyLLM model adapter.
-func New(opts ...Option) (*Model, error) {
+// provider is required; model name and extra fields are configured via WithModel and WithExtra.
+func New(provider anyllm.Provider, opts ...Option) (*Model, error) {
+	if provider == nil {
+		return nil, newError("provider is required")
+	}
+
 	cfg := &config{}
 
 	for _, opt := range opts {
@@ -31,12 +36,8 @@ func New(opts ...Option) (*Model, error) {
 		}
 	}
 
-	if err := cfg.validate(); err != nil {
-		return nil, err
-	}
-
 	return &Model{
-		provider:     cfg.provider,
+		provider:     provider,
 		defaultModel: cfg.model,
 		extra:        maps.Clone(cfg.extra),
 	}, nil
@@ -54,7 +55,7 @@ func (m *Model) GenerateContent(
 	stream bool,
 ) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
-		if m == nil || m.provider == nil {
+		if m == nil {
 			yield(nil, newError("model is not configured"))
 			return
 		}
