@@ -593,7 +593,6 @@ func TestApplyConfigToParamsUnsupportedFeatures(t *testing.T) {
 	}{
 		{"modelSelectionConfig", &genai.GenerateContentConfig{ModelSelectionConfig: &genai.ModelSelectionConfig{}}},
 		{"safetySettings", &genai.GenerateContentConfig{SafetySettings: []*genai.SafetySetting{{Category: genai.HarmCategoryHarassment, Threshold: genai.HarmBlockThresholdBlockLowAndAbove}}}},
-		{"config.tools", &genai.GenerateContentConfig{Tools: []*genai.Tool{{}}}},
 		{"cachedContent", &genai.GenerateContentConfig{CachedContent: "cache-001"}},
 		{"responseModalities", &genai.GenerateContentConfig{ResponseModalities: []string{"text"}}},
 		{"mediaResolution", &genai.GenerateContentConfig{MediaResolution: genai.MediaResolutionHigh}},
@@ -622,6 +621,23 @@ func TestApplyConfigToParamsUnsupportedFeatures(t *testing.T) {
 
 func int32Ptr(v int32) *int32       { return &v }
 func float32Ptr(v float32) *float32 { return &v }
+
+func TestApplyConfigToParamsToolsAccepted(t *testing.T) {
+	t.Parallel()
+
+	// Tools in Config.Tools are redundant (handled via req.Tools)
+	// and must be silently accepted, not rejected.
+	err := applyConfigToParams(&anyllm.CompletionParams{}, &genai.GenerateContentConfig{
+		Tools: []*genai.Tool{{
+			FunctionDeclarations: []*genai.FunctionDeclaration{
+				{Name: "ping", Description: "test"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("expected no error for tools in Config.Tools, got: %v", err)
+	}
+}
 
 func TestToolMessageFromFunctionResponse(t *testing.T) {
 	t.Parallel()

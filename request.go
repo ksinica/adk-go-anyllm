@@ -470,8 +470,13 @@ func applyConfigToParams(
 		return unsupportedFeatureError("modelSelectionConfig")
 	case len(cfg.SafetySettings) > 0:
 		return unsupportedFeatureError("safetySettings")
+	// Tools are populated by the ADK in both req.Config.Tools (genai format)
+	// and req.Tools (map format). We handle tools through req.Tools in
+	// convertTools(), so req.Config.Tools is redundant — skip it.
+	//
+	// Historically this returned an error, but the ADK llmagent always writes
+	// tools into both fields, making every tool-using agent hit this rejection.
 	case len(cfg.Tools) > 0:
-		return unsupportedFeatureError("config.tools")
 	case cfg.CachedContent != "":
 		return unsupportedFeatureError("cachedContent")
 	case len(cfg.ResponseModalities) > 0:
