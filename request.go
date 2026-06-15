@@ -487,8 +487,7 @@ func applyConfigToParams(
 		return unsupportedFeatureError("speechConfig")
 	case cfg.AudioTimestamp:
 		return unsupportedFeatureError("audioTimestamp")
-	case cfg.ThinkingConfig != nil:
-		return unsupportedFeatureError("thinkingConfig")
+	// ThinkingConfig is handled below in applyThinkingConfig.
 	case cfg.ImageConfig != nil:
 		return unsupportedFeatureError("imageConfig")
 	case cfg.EnableEnhancedCivicAnswers != nil:
@@ -529,6 +528,10 @@ func applyConfigToParams(
 		params.Seed = &value
 	}
 
+	if err := applyThinkingConfig(params, cfg); err != nil {
+		return err
+	}
+
 	if err := applyToolConfig(params, cfg); err != nil {
 		return err
 	}
@@ -541,6 +544,78 @@ func applyConfigToParams(
 		params.ResponseFormat = responseFormat
 	}
 
+	return nil
+}
+
+// thinkingBudgetThresholds maps ReasoningEffort levels to their minimum token budgets.
+// Used to pick the closest effort level when ThinkingBudget is set without a ThinkingLevel.
+// Values mirror the AnyLLM Gemini provider's hardcoded budgets (1024/8192/24576).
+var thinkingBudgetThresholds = []struct {
+	minBudget int32
+	effort    anyllm.ReasoningEffort
+}{
+	// Thresholds use midpoints between the Gemini provider's budget values
+	// (Low=1024, Medium=8192, High=24576) for intuitive tier selection.
+	// A budget of 10000 lands in Medium (8192–16383), a budget of 20000 in High (16384+).
+	{minBudget: 16384, effort: anyllm.ReasoningEffortHigh},
+	{minBudget: 4608, effort: anyllm.ReasoningEffortMedium},
+	{minBudget: 1, effort: anyllm.ReasoningEffortLow},
+}
+
+// applyThinkingConfig translates ADK's ThinkingConfig to AnyLLM's ReasoningEffort.
+func applyThinkingConfig(
+	params *anyllm.CompletionParams,
+	cfg *genai.GenerateContentConfig,
+) error {
+	if cfg == nil || cfg.ThinkingConfig == nil {
+		return nil
+	}
+
+	tc := cfg.ThinkingConfig
+
+	// If IncludeThoughts is false and no other signal is set, treat as disabled.
+	// ThinkingLevel zero value is empty string, not ThinkingLevelUnspecified.
+	isDefaultLevel := tc.ThinkingLevel == "" || tc.ThinkingLevel == genai.ThinkingLevelUnspecified
+	if !tc.IncludeThoughts && tc.ThinkingBudget == nil && isDefaultLevel {
+		return nil
+	}
+
+	// Map by ThinkingLevel first (most explicit signal).
+	if tc.ThinkingLevel != "" && tc.ThinkingLevel != genai.ThinkingLevelUnspecified {
+		switch tc.ThinkingLevel {
+		case genai.ThinkingLevelMinimal, genai.ThinkingLevelLow:
+			params.ReasoningEffort = anyllm.ReasoningEffortLow
+		case genai.ThinkingLevelMedium:
+			params.ReasoningEffort = anyllm.ReasoningEffortMedium
+		case genai.ThinkingLevelHigh:
+			params.ReasoningEffort = anyllm.ReasoningEffortHigh
+		default:
+			return unsupportedFeatureErrorf("thinkingLevel %q", tc.ThinkingLevel)
+		}
+
+		return nil
+	}
+
+	// Fall back to ThinkingBudget if set without a level.
+	if tc.ThinkingBudget != nil {
+		budget := *tc.ThinkingBudget
+		if budget <= 0 {
+			return nil
+		}
+
+		for _, tier := range thinkingBudgetThresholds {
+			if budget >= tier.minBudget {
+				params.ReasoningEffort = tier.effort
+				return nil
+			}
+		}
+
+		params.ReasoningEffort = anyllm.ReasoningEffortLow
+		return nil
+	}
+
+	// IncludeThoughts=true with no budget or level means model default.
+	params.ReasoningEffort = anyllm.ReasoningEffortAuto
 	return nil
 }
 

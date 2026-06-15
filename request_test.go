@@ -598,7 +598,6 @@ func TestApplyConfigToParamsUnsupportedFeatures(t *testing.T) {
 		{"mediaResolution", &genai.GenerateContentConfig{MediaResolution: genai.MediaResolutionHigh}},
 		{"speechConfig", &genai.GenerateContentConfig{SpeechConfig: &genai.SpeechConfig{}}},
 		{"audioTimestamp", &genai.GenerateContentConfig{AudioTimestamp: true}},
-		{"thinkingConfig", &genai.GenerateContentConfig{ThinkingConfig: &genai.ThinkingConfig{}}},
 		{"imageConfig", &genai.GenerateContentConfig{ImageConfig: &genai.ImageConfig{}}},
 		{"enableEnhancedCivicAnswers", &genai.GenerateContentConfig{EnableEnhancedCivicAnswers: ptr(true)}},
 		{"modelArmorConfig", &genai.GenerateContentConfig{ModelArmorConfig: &genai.ModelArmorConfig{}}},
@@ -614,6 +613,221 @@ func TestApplyConfigToParamsUnsupportedFeatures(t *testing.T) {
 			err := applyConfigToParams(&anyllm.CompletionParams{}, tt.cfg)
 			if !errors.Is(err, ErrUnsupportedFeature) {
 				t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+			}
+		})
+	}
+}
+
+func TestApplyThinkingConfig(t *testing.T) {
+	t.Parallel()
+
+	minimal := genai.ThinkingLevelMinimal
+	low := genai.ThinkingLevelLow
+	medium := genai.ThinkingLevelMedium
+	high := genai.ThinkingLevelHigh
+	unspecified := genai.ThinkingLevelUnspecified
+
+	budget := func(v int32) *int32 { return &v }
+
+	tests := []struct {
+		name          string
+		cfg           *genai.GenerateContentConfig
+		wantEffort    anyllm.ReasoningEffort
+		wantErr       bool
+		wantErrUnsupp bool
+	}{
+		// Level-based mapping (most explicit signal).
+		{
+			name: "nil config",
+			cfg:  nil,
+		},
+		{
+			name: "nil ThinkingConfig",
+			cfg:  &genai.GenerateContentConfig{},
+		},
+		{
+			name: "all defaults no-op",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{},
+			},
+		},
+		{
+			name: "IncludeThoughts=false no-op",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{IncludeThoughts: false},
+			},
+		},
+		{
+			name: "ThinkingLevelMinimal",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingLevel: minimal},
+			},
+			wantEffort: anyllm.ReasoningEffortLow,
+		},
+		{
+			name: "ThinkingLevelLow",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingLevel: low},
+			},
+			wantEffort: anyllm.ReasoningEffortLow,
+		},
+		{
+			name: "ThinkingLevelMedium",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingLevel: medium},
+			},
+			wantEffort: anyllm.ReasoningEffortMedium,
+		},
+		{
+			name: "ThinkingLevelHigh",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingLevel: high},
+			},
+			wantEffort: anyllm.ReasoningEffortHigh,
+		},
+		{
+			name: "IncludeThoughts with no level or budget defaults to auto",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{IncludeThoughts: true},
+			},
+			wantEffort: anyllm.ReasoningEffortAuto,
+		},
+		// Budget-based fallback (no ThinkingLevel set).
+		{
+			name: "budget 0 no-op",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(0)},
+			},
+		},
+		{
+			name: "budget negative no-op",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(-1)},
+			},
+		},
+		{
+			name: "budget 500 -> low",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(500)},
+			},
+			wantEffort: anyllm.ReasoningEffortLow,
+		},
+		{
+			name: "budget 1024 -> low",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(1024)},
+			},
+			wantEffort: anyllm.ReasoningEffortLow,
+		},
+		{
+			name: "budget 5000 -> medium",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(5000)},
+			},
+			wantEffort: anyllm.ReasoningEffortMedium,
+		},
+		{
+			name: "budget 8192 -> medium",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(8192)},
+			},
+			wantEffort: anyllm.ReasoningEffortMedium,
+		},
+		{
+			name: "budget 10000 -> medium",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(10000)},
+			},
+			wantEffort: anyllm.ReasoningEffortMedium,
+		},
+		{
+			name: "budget 20000 -> high",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(20000)},
+			},
+			wantEffort: anyllm.ReasoningEffortHigh,
+		},
+		{
+			name: "budget 24576 -> high",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(24576)},
+			},
+			wantEffort: anyllm.ReasoningEffortHigh,
+		},
+		// Level takes precedence over budget when both are set.
+		{
+			name: "level+Medium overrides budget 500",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{
+					ThinkingBudget: budget(500),
+					ThinkingLevel:  medium,
+				},
+			},
+			wantEffort: anyllm.ReasoningEffortMedium,
+		},
+		// Unspecified level with budget maps by budget.
+		{
+			name: "unspecified level + big budget maps by budget",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{
+					ThinkingBudget: budget(24576),
+					ThinkingLevel:  unspecified,
+				},
+			},
+			wantEffort: anyllm.ReasoningEffortHigh,
+		},
+		// Invalid ThinkingLevel is rejected.
+		{
+			name: "invalid ThinkingLevel",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{
+					ThinkingLevel: genai.ThinkingLevel("SUPER"),
+				},
+			},
+			wantErrUnsupp: true,
+		},
+		// Integration: applyConfigToParams happy path with ThinkingConfig.
+		{
+			name: "level via applyConfigToParams sets ReasoningEffort",
+			cfg: &genai.GenerateContentConfig{
+				ThinkingConfig: &genai.ThinkingConfig{ThinkingLevel: high},
+			},
+			wantEffort: anyllm.ReasoningEffortHigh,
+		},
+	}
+
+	// The last test uses the outer applyConfigToParams; the rest call applyThinkingConfig directly.
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var params anyllm.CompletionParams
+
+			var err error
+			// Use applyConfigToParams for the integration test, applyThinkingConfig for unit tests.
+			if tt.name == "level via applyConfigToParams sets ReasoningEffort" {
+				err = applyConfigToParams(&params, tt.cfg)
+			} else {
+				err = applyThinkingConfig(&params, tt.cfg)
+			}
+
+			if tt.wantErrUnsupp {
+				if !errors.Is(err, ErrUnsupportedFeature) {
+					t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+				}
+				return
+			}
+
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error but got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err != nil {
+				return
+			}
+
+			if params.ReasoningEffort != tt.wantEffort {
+				t.Fatalf("ReasoningEffort=%q, want %q", params.ReasoningEffort, tt.wantEffort)
 			}
 		})
 	}
