@@ -3,6 +3,7 @@ package adkanyllm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 
@@ -22,6 +23,10 @@ func TestParseArguments(t *testing.T) {
 		{name: "object json", raw: `{"ok":true}`},
 		{name: "empty json string", raw: ""},
 		{name: "invalid json", raw: `{"ok":`, expectedErr: true},
+		{name: "json null", raw: `null`},
+		{name: "json array", raw: `[1,2]`, expectedErr: true},
+		{name: "json string", raw: `"hi"`, expectedErr: true},
+		{name: "json number", raw: `5`, expectedErr: true},
 	}
 
 	for _, tt := range tests {
@@ -89,7 +94,7 @@ func TestResponseFromCompletionRejectsUsageOverflow(t *testing.T) {
 		Usage: &anyllm.Usage{
 			TotalTokens: int(math.MaxInt32) + 1,
 		},
-	})
+	}, false)
 	if err == nil {
 		t.Fatal("expected token overflow error")
 	}
@@ -119,7 +124,7 @@ func TestResponseFromCompletionToolCallTurnIsComplete(t *testing.T) {
 		},
 	}
 
-	resp, err := responseFromCompletion(completion)
+	resp, err := responseFromCompletion(completion, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -137,7 +142,7 @@ func TestResponseFromCompletionToolCallTurnIsComplete(t *testing.T) {
 func TestResponseFromCompletionNilCompletion(t *testing.T) {
 	t.Parallel()
 
-	_, err := responseFromCompletion(nil)
+	_, err := responseFromCompletion(nil, false)
 	if err == nil {
 		t.Fatal("expected error for nil completion")
 	}
@@ -146,7 +151,7 @@ func TestResponseFromCompletionNilCompletion(t *testing.T) {
 func TestResponseFromCompletionEmptyChoices(t *testing.T) {
 	t.Parallel()
 
-	resp, err := responseFromCompletion(&anyllm.ChatCompletion{Model: "gpt-test"})
+	resp, err := responseFromCompletion(&anyllm.ChatCompletion{Model: "gpt-test"}, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -155,6 +160,26 @@ func TestResponseFromCompletionEmptyChoices(t *testing.T) {
 	}
 	if resp.Content != nil {
 		t.Fatal("expected nil content for empty choices")
+	}
+	if !resp.TurnComplete {
+		t.Fatal("expected TurnComplete=true even with zero choices")
+	}
+}
+
+// TestResponseFromCompletionRejectsMultipleChoices verifies that a provider
+// returning more than one choice fails loudly instead of silently
+// discarding every choice past Choices[0].
+func TestResponseFromCompletionRejectsMultipleChoices(t *testing.T) {
+	t.Parallel()
+
+	_, err := responseFromCompletion(&anyllm.ChatCompletion{
+		Choices: []anyllm.Choice{
+			{Message: anyllm.Message{Content: "first"}},
+			{Message: anyllm.Message{Content: "second"}},
+		},
+	}, false)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
 	}
 }
 
@@ -169,7 +194,7 @@ func TestContentFromMessageRejectsUnsupportedToolType(t *testing.T) {
 				Arguments: `{}`,
 			},
 		}},
-	})
+	}, false)
 	if err == nil {
 		t.Fatal("expected unsupported tool type error")
 	}
@@ -183,13 +208,13 @@ func TestContentFromMessageRejectsMissingToolName(t *testing.T) {
 			Type:     toolTypeFunction,
 			Function: anyllm.FunctionCall{Arguments: `{}`},
 		}},
-	})
+	}, false)
 	if err == nil {
 		t.Fatal("expected missing tool name error")
 	}
 }
 
-func TestWrapProviderErrorPreservesWrappedErrors(t *testing.T) {
+func TestWrapProviderErrorPreservesAdapterErrors(t *testing.T) {
 	t.Parallel()
 
 	cause := wrapError("upstream", errors.New("root"))
@@ -213,6 +238,32 @@ func TestWrapProviderErrorWrapsPlainErrors(t *testing.T) {
 	}
 }
 
+// TestWrapProviderErrorWrapsUnwrappableNonAdapterErrors verifies that an
+// error implementing Unwrap (e.g. via fmt.Errorf's %w) but that is NOT an
+// *AdapterError still gets adapter context added. Using "does it implement
+// Unwrap" as a proxy for "already has adapter context" let plain provider
+// errors escape wrapping while errors.New errors got wrapped -
+// inconsistent, and callers could not reliably errors.As to *AdapterError.
+func TestWrapProviderErrorWrapsUnwrappableNonAdapterErrors(t *testing.T) {
+	t.Parallel()
+
+	root := errors.New("root cause")
+	cause := fmt.Errorf("db timeout: %w", root)
+
+	got := wrapProviderError(cause)
+
+	var adapterErr *AdapterError
+	if !errors.As(got, &adapterErr) {
+		t.Fatalf("expected *AdapterError, got %T (%v)", got, got)
+	}
+	if !errors.Is(got, root) {
+		t.Fatal("expected wrapped cause to remain reachable via errors.Is")
+	}
+}
+
+// TestResponseFromCompletionMapsReasoning verifies that reasoning is
+// returned as a Thought part when the request set IncludeThoughts=true; that
+// is the correct precondition genai defines for returning thought summaries.
 func TestResponseFromCompletionMapsReasoning(t *testing.T) {
 	t.Parallel()
 
@@ -229,7 +280,7 @@ func TestResponseFromCompletionMapsReasoning(t *testing.T) {
 		},
 	}
 
-	resp, err := responseFromCompletion(completion)
+	resp, err := responseFromCompletion(completion, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -238,6 +289,79 @@ func TestResponseFromCompletionMapsReasoning(t *testing.T) {
 	}
 	if !resp.Content.Parts[1].Thought || resp.Content.Parts[1].Text != "thinking" {
 		t.Fatalf("unexpected reasoning part: %#v", resp.Content.Parts[1])
+	}
+}
+
+// TestResponseFromCompletionSuppressesReasoningWhenNotIncluded verifies the
+// item-2 fix: with IncludeThoughts=false (the default), a provider's
+// reasoning must not surface as a Thought part, even though reasoning effort
+// itself is enabled server-side and the provider returned reasoning content.
+func TestResponseFromCompletionSuppressesReasoningWhenNotIncluded(t *testing.T) {
+	t.Parallel()
+
+	completion := &anyllm.ChatCompletion{
+		Choices: []anyllm.Choice{
+			{
+				Message: anyllm.Message{
+					Content: "answer",
+					Reasoning: &anyllm.Reasoning{
+						Content: "thinking",
+					},
+				},
+			},
+		},
+	}
+
+	resp, err := responseFromCompletion(completion, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.Content.Parts) != 1 {
+		t.Fatalf("expected reasoning to be suppressed, got %d parts: %#v", len(resp.Content.Parts), resp.Content.Parts)
+	}
+	for _, part := range resp.Content.Parts {
+		if part.Thought {
+			t.Fatalf("unexpected Thought part when IncludeThoughts=false: %#v", part)
+		}
+	}
+}
+
+func TestContentFromMessageConvertsTextContentParts(t *testing.T) {
+	t.Parallel()
+
+	resp, err := contentFromMessage(anyllm.Message{
+		Content: []anyllm.ContentPart{
+			{Type: contentTypeText, Text: "hello"},
+			{Type: contentTypeText, Text: "world"},
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.Parts) != 1 || resp.Parts[0].Text != "hello\nworld" {
+		t.Fatalf("unexpected parts: %#v", resp.Parts)
+	}
+}
+
+func TestContentFromMessageRejectsUnsupportedContentPartType(t *testing.T) {
+	t.Parallel()
+
+	_, err := contentFromMessage(anyllm.Message{
+		Content: []anyllm.ContentPart{
+			{Type: contentTypeImageURL, ImageURL: &anyllm.ImageURL{URL: "https://example.com/x.png"}},
+		},
+	}, false)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+func TestContentFromMessageRejectsUnsupportedContentType(t *testing.T) {
+	t.Parallel()
+
+	_, err := contentFromMessage(anyllm.Message{Content: 5}, false)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
 	}
 }
 
@@ -256,7 +380,7 @@ func TestGenerateOnceRejectsNilCompletion(t *testing.T) {
 		gotErr = err
 		return true
 	}
-	m.generateOnce(ctx, anyllm.CompletionParams{}, yield)
+	m.generateOnce(ctx, anyllm.CompletionParams{}, false, yield)
 	if gotErr == nil {
 		t.Fatal("expected nil completion error")
 	}
@@ -268,5 +392,109 @@ func TestUsageMetadataFromUsageZeroIsNil(t *testing.T) {
 	got, err := usageMetadataFromUsage(&anyllm.Usage{})
 	if err != nil || got != nil {
 		t.Fatalf("expected nil, got %#v err=%v", got, err)
+	}
+}
+
+func TestContentFromMessageSynthesizesEmptyToolCallID(t *testing.T) {
+	t.Parallel()
+
+	content, err := contentFromMessage(anyllm.Message{
+		ToolCalls: []anyllm.ToolCall{{
+			Type:     toolTypeFunction,
+			Function: anyllm.FunctionCall{Name: "get_weather", Arguments: `{"city":"Paris"}`},
+		}},
+	}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	fc := content.Parts[0].FunctionCall
+	if fc == nil || fc.ID == "" {
+		t.Fatalf("expected synthesized non-empty id, got %#v", fc)
+	}
+}
+
+func TestContentFromMessageSynthesizesUniqueIDsAcrossMultipleToolCalls(t *testing.T) {
+	t.Parallel()
+
+	content, err := contentFromMessage(anyllm.Message{
+		ToolCalls: []anyllm.ToolCall{
+			{Type: toolTypeFunction, Function: anyllm.FunctionCall{Name: "get_weather", Arguments: `{}`}},
+			{Type: toolTypeFunction, Function: anyllm.FunctionCall{Name: "get_weather", Arguments: `{}`}},
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	id1 := content.Parts[0].FunctionCall.ID
+	id2 := content.Parts[1].FunctionCall.ID
+	if id1 == "" || id2 == "" || id1 == id2 {
+		t.Fatalf("expected distinct synthesized ids, got %q and %q", id1, id2)
+	}
+}
+
+// TestContentFromMessageAvoidsCollisionWithExplicitProviderID verifies the
+// item-2 fix: a synthesized id for an ID-less tool call is checked against
+// the explicit ids of other tool calls in the same response, and advanced
+// past a collision rather than reusing one.
+func TestContentFromMessageAvoidsCollisionWithExplicitProviderID(t *testing.T) {
+	t.Parallel()
+
+	content, err := contentFromMessage(anyllm.Message{
+		ToolCalls: []anyllm.ToolCall{
+			{ID: "call_lookup_2", Type: toolTypeFunction, Function: anyllm.FunctionCall{Name: "lookup", Arguments: `{}`}},
+			{Type: toolTypeFunction, Function: anyllm.FunctionCall{Name: "lookup", Arguments: `{}`}},
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	id1 := content.Parts[0].FunctionCall.ID
+	id2 := content.Parts[1].FunctionCall.ID
+	if id1 != "call_lookup_2" {
+		t.Fatalf("id1=%q expected explicit call_lookup_2 preserved", id1)
+	}
+	if id2 == "" || id2 == id1 {
+		t.Fatalf("expected synthesized id2 distinct from explicit id1, got %q", id2)
+	}
+	if id2 != "call_lookup_3" {
+		t.Fatalf("id2=%q expected advanced past collision to call_lookup_3", id2)
+	}
+}
+
+// TestContentFromMessageRejectsDuplicateExplicitToolCallIDs verifies the
+// item-3 fix: two provider tool calls sharing the same explicit,
+// non-empty id are rejected during pre-registration rather than silently
+// preserved, since that would make later FunctionResponse correlation
+// ambiguous.
+func TestContentFromMessageRejectsDuplicateExplicitToolCallIDs(t *testing.T) {
+	t.Parallel()
+
+	_, err := contentFromMessage(anyllm.Message{
+		ToolCalls: []anyllm.ToolCall{
+			{ID: "call_1", Type: toolTypeFunction, Function: anyllm.FunctionCall{Name: "get_weather", Arguments: `{}`}},
+			{ID: "call_1", Type: toolTypeFunction, Function: anyllm.FunctionCall{Name: "get_time", Arguments: `{}`}},
+		},
+	}, false)
+	var adapterErr *AdapterError
+	if !errors.As(err, &adapterErr) {
+		t.Fatalf("expected *AdapterError for duplicate explicit tool call id, got %v", err)
+	}
+}
+
+func TestContentFromMessagePreservesNonEmptyToolCallID(t *testing.T) {
+	t.Parallel()
+
+	content, err := contentFromMessage(anyllm.Message{
+		ToolCalls: []anyllm.ToolCall{{
+			ID:       "call_1",
+			Type:     toolTypeFunction,
+			Function: anyllm.FunctionCall{Name: "get_weather", Arguments: `{}`},
+		}},
+	}, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := content.Parts[0].FunctionCall.ID; got != "call_1" {
+		t.Fatalf("ID=%q expected call_1", got)
 	}
 }

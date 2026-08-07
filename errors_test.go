@@ -64,10 +64,19 @@ func TestWrapErrorf(t *testing.T) {
 
 	cause := errors.New("root")
 	err := wrapErrorf("wrapped: %s", cause, "details")
-	if err == nil || err.Error() != "adkanyllm: wrapped: details" {
+	if err == nil || err.Error() != "adkanyllm: wrapped: details: root" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !errors.Is(err, cause) {
 		t.Fatal("expected errors.Is to traverse to cause")
+	}
+}
+
+func TestAdapterErrorStringOmitsCauseWhenNil(t *testing.T) {
+	t.Parallel()
+
+	err := wrapError("provider completion", nil)
+	if got := err.Error(); got != "adkanyllm: provider completion" {
+		t.Fatalf("Error()=%q expected adkanyllm: provider completion", got)
 	}
 }

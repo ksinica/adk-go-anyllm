@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	anyllm "github.com/mozilla-ai/any-llm-go"
 	"google.golang.org/adk/model"
 	"google.golang.org/genai"
@@ -182,6 +183,34 @@ func TestApplyToolConfigUnsupportedBranches(t *testing.T) {
 	}
 }
 
+func TestApplyToolConfigAcceptsExplicitFalseBoolFields(t *testing.T) {
+	t.Parallel()
+
+	falsePtr := func() *bool { v := false; return &v }
+
+	// IncludeServerSideToolInvocations=false is the normal "off" state, not a signal.
+	err := applyToolConfig(&anyllm.CompletionParams{}, &genai.GenerateContentConfig{
+		ToolConfig: &genai.ToolConfig{
+			IncludeServerSideToolInvocations: falsePtr(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error for IncludeServerSideToolInvocations=false: %v", err)
+	}
+
+	// StreamFunctionCallArguments=false is the normal "off" state, not a signal.
+	err = applyToolConfig(&anyllm.CompletionParams{}, &genai.GenerateContentConfig{
+		ToolConfig: &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				StreamFunctionCallArguments: falsePtr(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error for StreamFunctionCallArguments=false: %v", err)
+	}
+}
+
 func TestResponseFormatFromConfig(t *testing.T) {
 	t.Parallel()
 
@@ -263,6 +292,28 @@ func TestResponseFormatFromConfigSchemaAndJsonSchemaMutuallyExclusive(t *testing
 	}
 }
 
+// TestResponseFormatFromConfigTypedNilResponseJsonSchemaIgnored verifies
+// that a typed-nil ResponseJsonSchema (e.g. a nil *jsonschema.Schema boxed
+// into the any field) is treated as absent: it must not trip the
+// mutual-exclusivity check against a real ResponseSchema, nor produce a
+// json_schema format built from a nil schema.
+func TestResponseFormatFromConfigTypedNilResponseJsonSchemaIgnored(t *testing.T) {
+	t.Parallel()
+
+	var typedNilJSONSchema *jsonschema.Schema
+
+	got, err := responseFormatFromConfig(&genai.GenerateContentConfig{
+		ResponseSchema:     &genai.Schema{Type: genai.TypeObject},
+		ResponseJsonSchema: typedNilJSONSchema,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil || got.Type != responseFormatJSONSchema {
+		t.Fatalf("expected json_schema built from ResponseSchema, got %#v", got)
+	}
+}
+
 func TestResponseFormatFromConfigSchemaWithNonJsonMime(t *testing.T) {
 	t.Parallel()
 
@@ -337,7 +388,11 @@ func TestApplyToolConfigModeNone(t *testing.T) {
 func TestApplyToolConfigModeAnyWithAllowedName(t *testing.T) {
 	t.Parallel()
 
-	var params anyllm.CompletionParams
+	params := anyllm.CompletionParams{
+		Tools: []anyllm.Tool{
+			{Type: toolTypeFunction, Function: anyllm.Function{Name: "get_weather"}},
+		},
+	}
 	err := applyToolConfig(&params, &genai.GenerateContentConfig{
 		ToolConfig: &genai.ToolConfig{
 			FunctionCallingConfig: &genai.FunctionCallingConfig{
@@ -355,6 +410,77 @@ func TestApplyToolConfigModeAnyWithAllowedName(t *testing.T) {
 	}
 }
 
+// TestApplyToolConfigModeAnySingleNameNotDeclaredIsUnsupported verifies that
+// a single allowedFunctionNames entry that names no declared tool fails
+// loudly instead of silently pinning ToolChoice to a function the model was
+// never told about.
+func TestApplyToolConfigModeAnySingleNameNotDeclaredIsUnsupported(t *testing.T) {
+	t.Parallel()
+
+	params := anyllm.CompletionParams{
+		Tools: []anyllm.Tool{
+			{Type: toolTypeFunction, Function: anyllm.Function{Name: "get_time"}},
+		},
+	}
+	err := applyToolConfig(&params, &genai.GenerateContentConfig{
+		ToolConfig: &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode:                 genai.FunctionCallingConfigModeAny,
+				AllowedFunctionNames: []string{"get_weather"},
+			},
+		},
+	})
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+// TestApplyToolConfigModeAnyNoAllowedNamesRequiresDeclaredTools verifies that
+// mode ANY with no allowedFunctionNames (an unrestricted "any tool") fails
+// loudly when there are no declared tools to require use of, rather than
+// setting ToolChoice=required with nothing for the provider to choose from.
+func TestApplyToolConfigModeAnyNoAllowedNamesRequiresDeclaredTools(t *testing.T) {
+	t.Parallel()
+
+	var params anyllm.CompletionParams
+	err := applyToolConfig(&params, &genai.GenerateContentConfig{
+		ToolConfig: &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode: genai.FunctionCallingConfigModeAny,
+			},
+		},
+	})
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+// TestApplyToolConfigModeAnyNoAllowedNamesWithDeclaredTools verifies the
+// success path for mode ANY with no allowedFunctionNames: it requires tool
+// use from among whatever tools are already declared.
+func TestApplyToolConfigModeAnyNoAllowedNamesWithDeclaredTools(t *testing.T) {
+	t.Parallel()
+
+	params := anyllm.CompletionParams{
+		Tools: []anyllm.Tool{
+			{Type: toolTypeFunction, Function: anyllm.Function{Name: "get_weather"}},
+		},
+	}
+	err := applyToolConfig(&params, &genai.GenerateContentConfig{
+		ToolConfig: &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode: genai.FunctionCallingConfigModeAny,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if params.ToolChoice != toolChoiceRequired {
+		t.Fatalf("ToolChoice=%#v expected required", params.ToolChoice)
+	}
+}
+
 func TestConvertContentFunctionCall(t *testing.T) {
 	t.Parallel()
 
@@ -367,7 +493,7 @@ func TestConvertContentFunctionCall(t *testing.T) {
 				Args: map[string]any{"city": "Paris"},
 			},
 		}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -390,7 +516,7 @@ func TestConvertContentFunctionResponse(t *testing.T) {
 				Response: map[string]any{"temp": 20},
 			},
 		}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -408,7 +534,7 @@ func TestConvertContentRejectsMixedToolAndText(t *testing.T) {
 			{Text: "hello"},
 			{FunctionResponse: &genai.FunctionResponse{ID: "call_1"}},
 		},
-	})
+	}, nil)
 	if !errors.Is(err, ErrUnsupportedFeature) {
 		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
 	}
@@ -425,7 +551,7 @@ func TestConvertContentImageFileData(t *testing.T) {
 				MIMEType: "image/png",
 			},
 		}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -453,7 +579,12 @@ func TestBuildMessagesUnsupportedRole(t *testing.T) {
 	}
 }
 
-func TestApplyToolConfigModeValidated(t *testing.T) {
+// TestApplyToolConfigModeValidatedIsUnsupported verifies that VALIDATED mode
+// is rejected loudly rather than silently downgraded to AUTO: AnyLLM has no
+// strict/schema-validated tool-choice equivalent, so silently downgrading
+// would mislead the caller into believing calls are constrained to
+// schema-valid arguments when they are not.
+func TestApplyToolConfigModeValidatedIsUnsupported(t *testing.T) {
 	t.Parallel()
 
 	var params anyllm.CompletionParams
@@ -464,18 +595,41 @@ func TestApplyToolConfigModeValidated(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if params.ToolChoice != "auto" {
-		t.Fatalf("ToolChoice=%#v expected auto", params.ToolChoice)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
 	}
 }
 
-func TestApplyToolConfigModeAnyRequiresToolChoice(t *testing.T) {
+func TestApplyToolConfigModeAnyWithoutDeclaredToolsIsUnsupported(t *testing.T) {
 	t.Parallel()
 
+	// With multiple allowed names and no declared tools to restrict,
+	// AnyLLM cannot represent the allow-list; broadening to unrestricted
+	// "required" would silently drop the restriction, so this must fail loudly.
 	var params anyllm.CompletionParams
+	err := applyToolConfig(&params, &genai.GenerateContentConfig{
+		ToolConfig: &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode:                 genai.FunctionCallingConfigModeAny,
+				AllowedFunctionNames: []string{"a", "b"},
+			},
+		},
+	})
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+func TestApplyToolConfigModeAnyMultipleNamesFiltersTools(t *testing.T) {
+	t.Parallel()
+
+	params := anyllm.CompletionParams{
+		Tools: []anyllm.Tool{
+			{Type: toolTypeFunction, Function: anyllm.Function{Name: "a"}},
+			{Type: toolTypeFunction, Function: anyllm.Function{Name: "b"}},
+			{Type: toolTypeFunction, Function: anyllm.Function{Name: "c"}},
+		},
+	}
 	err := applyToolConfig(&params, &genai.GenerateContentConfig{
 		ToolConfig: &genai.ToolConfig{
 			FunctionCallingConfig: &genai.FunctionCallingConfig{
@@ -487,8 +641,37 @@ func TestApplyToolConfigModeAnyRequiresToolChoice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if params.ToolChoice != "required" {
+	if params.ToolChoice != toolChoiceRequired {
 		t.Fatalf("ToolChoice=%#v expected required", params.ToolChoice)
+	}
+	if len(params.Tools) != 2 {
+		t.Fatalf("expected tools filtered to allow-list, got %#v", params.Tools)
+	}
+	for _, tool := range params.Tools {
+		if tool.Function.Name != "a" && tool.Function.Name != "b" {
+			t.Fatalf("unexpected tool leaked through allow-list filter: %#v", tool)
+		}
+	}
+}
+
+func TestApplyToolConfigModeAnyMultipleNamesMatchesNoneIsUnsupported(t *testing.T) {
+	t.Parallel()
+
+	params := anyllm.CompletionParams{
+		Tools: []anyllm.Tool{
+			{Type: toolTypeFunction, Function: anyllm.Function{Name: "c"}},
+		},
+	}
+	err := applyToolConfig(&params, &genai.GenerateContentConfig{
+		ToolConfig: &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode:                 genai.FunctionCallingConfigModeAny,
+				AllowedFunctionNames: []string{"a", "b"},
+			},
+		},
+	})
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
 	}
 }
 
@@ -503,7 +686,7 @@ func TestConvertContentImageInlineData(t *testing.T) {
 				Data:     []byte{0x89, 0x50, 0x4e, 0x47},
 			},
 		}},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -581,6 +764,34 @@ func TestApplyConfigToParamsMaxTokens(t *testing.T) {
 	}
 }
 
+// TestApplyConfigToParamsRejectsNegativeCandidateCount verifies the item-4
+// fix: a negative CandidateCount fails loudly instead of being silently
+// treated as unset.
+func TestApplyConfigToParamsRejectsNegativeCandidateCount(t *testing.T) {
+	t.Parallel()
+
+	err := applyConfigToParams(&anyllm.CompletionParams{}, &genai.GenerateContentConfig{
+		CandidateCount: -1,
+	})
+	if err == nil {
+		t.Fatal("expected error for negative CandidateCount")
+	}
+}
+
+// TestApplyConfigToParamsRejectsNegativeMaxOutputTokens verifies the item-4
+// fix: a negative MaxOutputTokens fails loudly instead of being silently
+// treated as unset.
+func TestApplyConfigToParamsRejectsNegativeMaxOutputTokens(t *testing.T) {
+	t.Parallel()
+
+	err := applyConfigToParams(&anyllm.CompletionParams{}, &genai.GenerateContentConfig{
+		MaxOutputTokens: -1,
+	})
+	if err == nil {
+		t.Fatal("expected error for negative MaxOutputTokens")
+	}
+}
+
 func TestApplyConfigToParamsUnsupportedFeatures(t *testing.T) {
 	t.Parallel()
 
@@ -615,6 +826,18 @@ func TestApplyConfigToParamsUnsupportedFeatures(t *testing.T) {
 				t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
 			}
 		})
+	}
+}
+
+func TestApplyConfigToParamsAcceptsEnableEnhancedCivicAnswersFalse(t *testing.T) {
+	t.Parallel()
+
+	falseVal := false
+	err := applyConfigToParams(&anyllm.CompletionParams{}, &genai.GenerateContentConfig{
+		EnableEnhancedCivicAnswers: &falseVal,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error for EnableEnhancedCivicAnswers=false: %v", err)
 	}
 }
 
@@ -694,10 +917,11 @@ func TestApplyThinkingConfig(t *testing.T) {
 		},
 		// Budget-based fallback (no ThinkingLevel set).
 		{
-			name: "budget 0 no-op",
+			name: "budget 0 disables thinking",
 			cfg: &genai.GenerateContentConfig{
 				ThinkingConfig: &genai.ThinkingConfig{ThinkingBudget: budget(0)},
 			},
+			wantEffort: anyllm.ReasoningEffortNone,
 		},
 		{
 			name: "budget negative no-op",
@@ -853,19 +1077,52 @@ func TestApplyConfigToParamsToolsAccepted(t *testing.T) {
 	}
 }
 
+func TestBuildCompletionParamsAllowedFunctionNamesFiltersDeclaredTools(t *testing.T) {
+	t.Parallel()
+
+	params, err := buildCompletionParams(&model.LLMRequest{
+		Model: "gpt-4o-mini",
+		Contents: []*genai.Content{
+			genai.NewContentFromText("hello", genai.RoleUser),
+		},
+		Tools: map[string]any{
+			"a": map[string]any{"name": "a"},
+			"b": map[string]any{"name": "b"},
+			"c": map[string]any{"name": "c"},
+		},
+		Config: &genai.GenerateContentConfig{
+			ToolConfig: &genai.ToolConfig{
+				FunctionCallingConfig: &genai.FunctionCallingConfig{
+					Mode:                 genai.FunctionCallingConfigModeAny,
+					AllowedFunctionNames: []string{"a", "b"},
+				},
+			},
+		},
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(params.Tools) != 2 {
+		t.Fatalf("expected tools filtered to allow-list, got %#v", params.Tools)
+	}
+	if params.ToolChoice != toolChoiceRequired {
+		t.Fatalf("ToolChoice=%#v expected required", params.ToolChoice)
+	}
+}
+
 func TestToolMessageFromFunctionResponse(t *testing.T) {
 	t.Parallel()
 
 	// nil response.
-	_, err := toolMessageFromFunctionResponse(nil)
+	_, err := toolMessageFromFunctionResponse(nil, nil)
 	if err == nil {
 		t.Fatal("expected error for nil response")
 	}
 
-	// Missing ID.
+	// Missing ID with no pending id-less call to resolve against.
 	_, err = toolMessageFromFunctionResponse(&genai.FunctionResponse{
 		Response: map[string]any{"ok": true},
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("expected error for missing id")
 	}
@@ -874,7 +1131,7 @@ func TestToolMessageFromFunctionResponse(t *testing.T) {
 	msg, err := toolMessageFromFunctionResponse(&genai.FunctionResponse{
 		ID:       "call_1",
 		Response: map[string]any{"temp": 20},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -890,18 +1147,254 @@ func TestToolMessageFromFunctionResponse(t *testing.T) {
 	_, err = toolMessageFromFunctionResponse(&genai.FunctionResponse{
 		ID:           "call_1",
 		WillContinue: &willContinue,
-	})
+	}, nil)
 	if !errors.Is(err, ErrUnsupportedFeature) {
 		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+
+	// WillContinue=false is the normal "off" state, not a signal.
+	willContinueFalse := false
+	_, err = toolMessageFromFunctionResponse(&genai.FunctionResponse{
+		ID:           "call_1",
+		Response:     map[string]any{"ok": true},
+		WillContinue: &willContinueFalse,
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error for WillContinue=false: %v", err)
 	}
 
 	// Parts unsupported.
 	_, err = toolMessageFromFunctionResponse(&genai.FunctionResponse{
 		ID:    "call_1",
 		Parts: []*genai.FunctionResponsePart{genai.NewFunctionResponsePartFromBytes([]byte("data"), "text/plain")},
-	})
+	}, nil)
 	if !errors.Is(err, ErrUnsupportedFeature) {
 		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+// TestToolMessageFromFunctionResponseResolvesIDLessPendingCall verifies that
+// an ID-less FunctionResponse resolves back to the synthetic id that was
+// assigned to a preceding ID-less FunctionCall for the same function name.
+func TestToolMessageFromFunctionResponseResolvesIDLessPendingCall(t *testing.T) {
+	t.Parallel()
+
+	pending := newToolCallIDTracker()
+	pending.add("get_weather", "get_weather_1")
+
+	msg, err := toolMessageFromFunctionResponse(&genai.FunctionResponse{
+		Name:     "get_weather",
+		Response: map[string]any{"temp": 20},
+	}, pending)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msg.ToolCallID != "get_weather_1" {
+		t.Fatalf("ToolCallID=%q expected get_weather_1", msg.ToolCallID)
+	}
+}
+
+// TestToolMessageFromFunctionResponseNoMatchingPendingCallErrors verifies
+// that an ID-less FunctionResponse with no matching pending id-less call
+// fails loudly instead of silently proceeding with an empty tool call id.
+func TestToolMessageFromFunctionResponseNoMatchingPendingCallErrors(t *testing.T) {
+	t.Parallel()
+
+	pending := newToolCallIDTracker()
+	pending.add("get_time", "get_time_1")
+
+	_, err := toolMessageFromFunctionResponse(&genai.FunctionResponse{
+		Name:     "get_weather",
+		Response: map[string]any{"temp": 20},
+	}, pending)
+	if err == nil {
+		t.Fatal("expected error for function response with no matching pending call")
+	}
+}
+
+// TestBuildMessagesIDLessFunctionCallAndResponseRoundTrip verifies the
+// end-to-end fix: a Gemini-style history with an ID-less FunctionCall
+// followed by an ID-less FunctionResponse for the same function round-trips
+// through buildMessages, with the response resolving to the exact synthetic
+// id assigned to the call.
+func TestBuildMessagesIDLessFunctionCallAndResponseRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	messages, err := buildMessages(&model.LLMRequest{
+		Contents: []*genai.Content{
+			{
+				Role: genai.RoleModel,
+				Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{
+						Name: "get_weather",
+						Args: map[string]any{"city": "Paris"},
+					},
+				}},
+			},
+			{
+				Role: genai.RoleUser,
+				Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{
+						Name:     "get_weather",
+						Response: map[string]any{"temp": 20},
+					},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(messages))
+	}
+
+	callID := messages[0].ToolCalls[0].ID
+	if callID == "" {
+		t.Fatal("expected a synthesized non-empty call id")
+	}
+	if messages[1].ToolCallID != callID {
+		t.Fatalf("ToolCallID=%q expected to match call id %q", messages[1].ToolCallID, callID)
+	}
+}
+
+// TestBuildMessagesIDLessFunctionCallAndResponseRoundTripMultipleNames
+// verifies that two ID-less calls with distinct names each resolve to their
+// own response by name, rather than mismatching in call order.
+func TestBuildMessagesIDLessFunctionCallAndResponseRoundTripMultipleNames(t *testing.T) {
+	t.Parallel()
+
+	messages, err := buildMessages(&model.LLMRequest{
+		Contents: []*genai.Content{
+			{
+				Role: genai.RoleModel,
+				Parts: []*genai.Part{
+					{FunctionCall: &genai.FunctionCall{Name: "get_weather"}},
+					{FunctionCall: &genai.FunctionCall{Name: "get_time"}},
+				},
+			},
+			{
+				Role: genai.RoleUser,
+				Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{
+						Name:     "get_time",
+						Response: map[string]any{"time": "10:00"},
+					},
+				}},
+			},
+			{
+				Role: genai.RoleUser,
+				Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{
+						Name:     "get_weather",
+						Response: map[string]any{"temp": 20},
+					},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(messages))
+	}
+
+	weatherCallID := messages[0].ToolCalls[0].ID
+	timeCallID := messages[0].ToolCalls[1].ID
+	if weatherCallID == timeCallID {
+		t.Fatalf("expected distinct synthesized ids, got %q and %q", weatherCallID, timeCallID)
+	}
+	if messages[1].ToolCallID != timeCallID {
+		t.Fatalf("first response ToolCallID=%q expected to match get_time call id %q", messages[1].ToolCallID, timeCallID)
+	}
+	if messages[2].ToolCallID != weatherCallID {
+		t.Fatalf("second response ToolCallID=%q expected to match get_weather call id %q", messages[2].ToolCallID, weatherCallID)
+	}
+}
+
+// TestBuildMessagesIDLessFunctionCallDistinctIDsAcrossTurns verifies the
+// item-1 fix: two ID-less calls to the same function name in different
+// assistant turns get distinct request-wide ids (rather than both resetting
+// to e.g. "lookup_1" because id allocation reset per Content), and each
+// turn's ID-less response still resolves to the matching call.
+func TestBuildMessagesIDLessFunctionCallDistinctIDsAcrossTurns(t *testing.T) {
+	t.Parallel()
+
+	messages, err := buildMessages(&model.LLMRequest{
+		Contents: []*genai.Content{
+			{
+				Role: genai.RoleModel,
+				Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{Name: "lookup", Args: map[string]any{"q": "first"}},
+				}},
+			},
+			{
+				Role: genai.RoleUser,
+				Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{Name: "lookup", Response: map[string]any{"result": "one"}},
+				}},
+			},
+			{
+				Role: genai.RoleModel,
+				Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{Name: "lookup", Args: map[string]any{"q": "second"}},
+				}},
+			},
+			{
+				Role: genai.RoleUser,
+				Parts: []*genai.Part{{
+					FunctionResponse: &genai.FunctionResponse{Name: "lookup", Response: map[string]any{"result": "two"}},
+				}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages, got %d", len(messages))
+	}
+
+	firstCallID := messages[0].ToolCalls[0].ID
+	secondCallID := messages[2].ToolCalls[0].ID
+	if firstCallID == "" || secondCallID == "" || firstCallID == secondCallID {
+		t.Fatalf("expected distinct synthesized ids across turns, got %q and %q", firstCallID, secondCallID)
+	}
+	if messages[1].ToolCallID != firstCallID {
+		t.Fatalf("first response ToolCallID=%q expected to match first call id %q", messages[1].ToolCallID, firstCallID)
+	}
+	if messages[3].ToolCallID != secondCallID {
+		t.Fatalf("second response ToolCallID=%q expected to match second call id %q", messages[3].ToolCallID, secondCallID)
+	}
+}
+
+// TestBuildMessagesRejectsDuplicateExplicitFunctionCallIDs verifies that two
+// genai.FunctionCall parts sharing the same explicit, non-empty id anywhere
+// in the request are rejected rather than silently accepted, since a
+// duplicate id makes the request's tool-call history ambiguous.
+func TestBuildMessagesRejectsDuplicateExplicitFunctionCallIDs(t *testing.T) {
+	t.Parallel()
+
+	_, err := buildMessages(&model.LLMRequest{
+		Contents: []*genai.Content{
+			{
+				Role: genai.RoleModel,
+				Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{ID: "call_1", Name: "lookup", Args: map[string]any{"q": "first"}},
+				}},
+			},
+			{
+				Role: genai.RoleModel,
+				Parts: []*genai.Part{{
+					FunctionCall: &genai.FunctionCall{ID: "call_1", Name: "lookup", Args: map[string]any{"q": "second"}},
+				}},
+			},
+		},
+	})
+	var adapterErr *AdapterError
+	if !errors.As(err, &adapterErr) {
+		t.Fatalf("expected *AdapterError for duplicate explicit id, got %v", err)
 	}
 }
 
@@ -909,19 +1402,20 @@ func TestToolCallFromFunctionCall(t *testing.T) {
 	t.Parallel()
 
 	// nil call.
-	_, err := toolCallFromFunctionCall(nil, 0)
+	_, err := toolCallFromFunctionCall(nil, nil, 0)
 	if err == nil {
 		t.Fatal("expected error for nil call")
 	}
 
 	// Missing name.
-	_, err = toolCallFromFunctionCall(&genai.FunctionCall{ID: "c1"}, 0)
+	_, err = toolCallFromFunctionCall(&genai.FunctionCall{ID: "c1"}, nil, 0)
 	if err == nil {
 		t.Fatal("expected error for empty name")
 	}
 
-	// Auto-generated ID when missing.
-	tc, err := toolCallFromFunctionCall(&genai.FunctionCall{Name: "get_weather"}, 1)
+	// Auto-generated ID when missing, via a nil tracker (isolated call, no
+	// request-wide collision checking).
+	tc, err := toolCallFromFunctionCall(&genai.FunctionCall{Name: "get_weather"}, nil, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -934,7 +1428,7 @@ func TestToolCallFromFunctionCall(t *testing.T) {
 		ID:   "c2",
 		Name: "search",
 		Args: map[string]any{"q": "hello"},
-	}, 0)
+	}, nil, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -946,9 +1440,64 @@ func TestToolCallFromFunctionCall(t *testing.T) {
 	_, err = toolCallFromFunctionCall(&genai.FunctionCall{
 		Name:        "fn",
 		PartialArgs: []*genai.PartialArg{{}},
-	}, 0)
+	}, nil, 0)
 	if !errors.Is(err, ErrUnsupportedFeature) {
 		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+
+	// WillContinue=true unsupported.
+	willContinueTrue := true
+	_, err = toolCallFromFunctionCall(&genai.FunctionCall{
+		Name:         "fn",
+		WillContinue: &willContinueTrue,
+	}, nil, 0)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+
+	// WillContinue=false is the normal "off" state, not a signal.
+	willContinueFalse := false
+	_, err = toolCallFromFunctionCall(&genai.FunctionCall{
+		Name:         "fn",
+		WillContinue: &willContinueFalse,
+	}, nil, 0)
+	if err != nil {
+		t.Fatalf("unexpected error for WillContinue=false: %v", err)
+	}
+}
+
+// TestToolCallIDTrackerAllocateAdvancesPastSeededCollision verifies that
+// allocate advances past a candidate id already seeded from an explicit
+// genai.FunctionCall.ID elsewhere in the request, rather than handing out a
+// colliding synthetic id.
+func TestToolCallIDTrackerAllocateAdvancesPastSeededCollision(t *testing.T) {
+	t.Parallel()
+
+	tracker := newToolCallIDTracker()
+	if err := tracker.seed("lookup_1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if id := tracker.allocate("lookup", 1); id != "lookup_2" {
+		t.Fatalf("id=%q expected lookup_2", id)
+	}
+}
+
+// TestToolCallIDTrackerSeedRejectsDuplicateExplicitID verifies that seeding
+// the same explicit id twice returns a validation error instead of
+// silently accepting an ambiguous request-wide id.
+func TestToolCallIDTrackerSeedRejectsDuplicateExplicitID(t *testing.T) {
+	t.Parallel()
+
+	tracker := newToolCallIDTracker()
+	if err := tracker.seed("call_1"); err != nil {
+		t.Fatalf("unexpected error on first seed: %v", err)
+	}
+
+	err := tracker.seed("call_1")
+	var adapterErr *AdapterError
+	if !errors.As(err, &adapterErr) {
+		t.Fatalf("expected *AdapterError for duplicate seed, got %v", err)
 	}
 }
 
@@ -1029,7 +1578,7 @@ func TestConvertContentUnsupportedPartVariants(t *testing.T) {
 			Text:       "hello",
 			InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte{1}},
 		}},
-	})
+	}, nil)
 	if err == nil {
 		t.Fatal("expected error for multiple part variants")
 	}
@@ -1056,11 +1605,128 @@ func TestConvertContentUnsupportedParts(t *testing.T) {
 			_, err := convertContent(&genai.Content{
 				Role:  genai.RoleUser,
 				Parts: []*genai.Part{tt.part},
-			})
+			}, nil)
 			if !errors.Is(err, ErrUnsupportedFeature) {
 				t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
 			}
 		})
+	}
+}
+
+func TestConvertContentUserPureTextJoinsWithNewline(t *testing.T) {
+	t.Parallel()
+
+	messages, err := convertContent(&genai.Content{
+		Role: genai.RoleUser,
+		Parts: []*genai.Part{
+			{Text: "first"},
+			{Text: "second"},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(messages))
+	}
+	content, ok := messages[0].Content.(string)
+	if !ok || content != "first\nsecond" {
+		t.Fatalf("expected newline-joined string content, got %#v", messages[0].Content)
+	}
+}
+
+func TestConvertContentThoughtPartRejectsExtraVariant(t *testing.T) {
+	t.Parallel()
+
+	_, err := convertContent(&genai.Content{
+		Role: genai.RoleModel,
+		Parts: []*genai.Part{{
+			Thought: true,
+			Text:    "thinking",
+			FunctionCall: &genai.FunctionCall{
+				Name: "get_weather",
+			},
+		}},
+	}, nil)
+	if err == nil {
+		t.Fatal("expected error for thought part with an extra variant set")
+	}
+}
+
+func TestConvertContentThoughtPartRejectsModifiers(t *testing.T) {
+	t.Parallel()
+
+	_, err := convertContent(&genai.Content{
+		Role: genai.RoleModel,
+		Parts: []*genai.Part{{
+			Thought:       true,
+			Text:          "thinking",
+			VideoMetadata: &genai.VideoMetadata{},
+		}},
+	}, nil)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+// TestConvertContentRejectsThoughtSignatureOnFunctionCallPart verifies that
+// a non-empty ThoughtSignature is rejected on a function-call part, not just
+// on a thought part: rejectPartModifiers runs for every part, so the
+// signature can no longer be silently discarded on text/function-call parts.
+func TestConvertContentRejectsThoughtSignatureOnFunctionCallPart(t *testing.T) {
+	t.Parallel()
+
+	_, err := convertContent(&genai.Content{
+		Role: genai.RoleModel,
+		Parts: []*genai.Part{{
+			FunctionCall: &genai.FunctionCall{
+				Name: "get_weather",
+			},
+			ThoughtSignature: []byte("opaque-signature"),
+		}},
+	}, nil)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+// TestConvertContentRejectsThoughtSignatureOnTextPart mirrors the
+// function-call case for a plain text part.
+func TestConvertContentRejectsThoughtSignatureOnTextPart(t *testing.T) {
+	t.Parallel()
+
+	_, err := convertContent(&genai.Content{
+		Role: genai.RoleUser,
+		Parts: []*genai.Part{{
+			Text:             "hello",
+			ThoughtSignature: []byte("opaque-signature"),
+		}},
+	}, nil)
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+func TestContentToTextRejectsModifiers(t *testing.T) {
+	t.Parallel()
+
+	_, err := contentToText(&genai.Content{
+		Parts: []*genai.Part{{
+			Text:          "hello",
+			VideoMetadata: &genai.VideoMetadata{},
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected error for text part with a modifier set")
+	}
+
+	_, err = contentToText(&genai.Content{
+		Parts: []*genai.Part{{
+			MediaResolution: &genai.PartMediaResolution{},
+		}},
+	})
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
 	}
 }
 
@@ -1073,7 +1739,7 @@ func TestConvertContentUserMultimodal(t *testing.T) {
 			{Text: "describe this"},
 			{InlineData: &genai.Blob{MIMEType: "image/png", Data: []byte{1, 2, 3}}},
 		},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

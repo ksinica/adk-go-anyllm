@@ -14,8 +14,14 @@ type AdapterError struct {
 	message string
 }
 
-// Error returns the error message prefixed with the package name.
+// Error returns the error message prefixed with the package name, including
+// the wrapped cause when present so provider and JSON errors stay visible in
+// logs instead of being swallowed by the generic wrapper message.
 func (e *AdapterError) Error() string {
+	if e.cause != nil {
+		return fmt.Sprintf("adkanyllm: %s: %s", e.message, e.cause)
+	}
+
 	return fmt.Sprintf("adkanyllm: %s", e.message)
 }
 
@@ -62,24 +68,4 @@ func unsupportedFeatureError(feature string) error {
 
 func unsupportedFeatureErrorf(format string, args ...any) error {
 	return &UnsupportedFeatureError{Feature: fmt.Sprintf(format, args...)}
-}
-
-func canUnwrap(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	type singleUnwrapper interface {
-		Unwrap() error
-	}
-	type multiUnwrapper interface {
-		Unwrap() []error
-	}
-
-	var (
-		single singleUnwrapper
-		multi  multiUnwrapper
-	)
-
-	return errors.As(err, &single) || errors.As(err, &multi)
 }

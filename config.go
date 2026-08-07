@@ -22,7 +22,8 @@ func WithModel(model string) Option {
 	}
 }
 
-// WithExtra clones and merges provider-specific request fields into each completion.
+// WithExtra clones extra and sets it as the provider-specific request fields
+// included in each completion, replacing any value set by a previous WithExtra call.
 func WithExtra(extra map[string]any) Option {
 	return func(c *config) error {
 		if extra == nil {

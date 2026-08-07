@@ -2,6 +2,7 @@ package adkanyllm
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -78,6 +79,22 @@ func TestConvertToolsAcceptsAnyLLMTool(t *testing.T) {
 	}
 	if len(tools) != 1 || tools[0].Function.Name != "ping" {
 		t.Fatalf("unexpected tools: %#v", tools)
+	}
+}
+
+// TestConvertToolsRejectsDuplicateResolvedName verifies the item-3 fix: two
+// differently-keyed tool declarations that resolve to the same
+// Function.Name fail loudly instead of silently producing two tool
+// definitions AnyLLM cannot tell apart.
+func TestConvertToolsRejectsDuplicateResolvedName(t *testing.T) {
+	t.Parallel()
+
+	_, err := convertTools(map[string]any{
+		"a_weather": map[string]any{"name": "get_weather"},
+		"b_weather": map[string]any{"name": "get_weather"},
+	})
+	if err == nil {
+		t.Fatal("expected error for duplicate resolved tool name")
 	}
 }
 
@@ -200,6 +217,173 @@ func TestGenaiSchemaToMapNullable(t *testing.T) {
 	types, ok := got["type"].([]string)
 	if !ok || len(types) != 2 || types[1] != "null" {
 		t.Fatalf("unexpected nullable type: %#v", got["type"])
+	}
+}
+
+func TestGenaiSchemaToMapNullableUntyped(t *testing.T) {
+	t.Parallel()
+
+	nullable := true
+	got := genaiSchemaToMap(&genai.Schema{
+		Nullable: &nullable,
+	})
+	if _, ok := got["type"]; ok {
+		t.Fatalf("expected no synthesized type for untyped nullable schema, got %#v", got["type"])
+	}
+}
+
+// TestGenaiSchemaToMapNullableEnumWrapsAnyOf verifies that a nullable schema
+// with sibling value constraints (enum) is wrapped as {"anyOf":[<non-null
+// schema>, {"type":"null"}]} rather than merely widening "type" in place.
+// Widening alone would produce {"type":["string","null"],"enum":["a"]},
+// where null still fails the enum check because enum applies regardless of
+// the instance's type.
+func TestGenaiSchemaToMapNullableEnumWrapsAnyOf(t *testing.T) {
+	t.Parallel()
+
+	nullable := true
+	got := genaiSchemaToMap(&genai.Schema{
+		Type:     genai.TypeString,
+		Enum:     []string{"a"},
+		Nullable: &nullable,
+	})
+	if _, ok := got["type"]; ok {
+		t.Fatalf("expected no top-level type when wrapped in anyOf, got %#v", got["type"])
+	}
+	anyOf, ok := got["anyOf"].([]map[string]any)
+	if !ok || len(anyOf) != 2 {
+		t.Fatalf("expected anyOf with 2 branches, got %#v", got["anyOf"])
+	}
+	if anyOf[0]["type"] != "string" {
+		t.Fatalf("expected non-null branch to keep type=string, got %#v", anyOf[0])
+	}
+	enum, ok := anyOf[0]["enum"].([]string)
+	if !ok || len(enum) != 1 || enum[0] != "a" {
+		t.Fatalf("expected non-null branch to keep enum, got %#v", anyOf[0]["enum"])
+	}
+	if anyOf[1]["type"] != "null" {
+		t.Fatalf("expected null branch, got %#v", anyOf[1])
+	}
+}
+
+// TestGenaiSchemaToMapNullablePlainWidensTypeInPlace pins the simple case
+// (nullable with no sibling value constraints) to the minimal-churn
+// representation: widening "type" in place rather than wrapping in anyOf.
+func TestGenaiSchemaToMapNullablePlainWidensTypeInPlace(t *testing.T) {
+	t.Parallel()
+
+	nullable := true
+	got := genaiSchemaToMap(&genai.Schema{
+		Type:     genai.TypeString,
+		Nullable: &nullable,
+	})
+	if _, ok := got["anyOf"]; ok {
+		t.Fatalf("expected no anyOf wrapping for a plain nullable schema, got %#v", got["anyOf"])
+	}
+	types, ok := got["type"].([]string)
+	if !ok || len(types) != 2 || types[0] != "string" || types[1] != "null" {
+		t.Fatalf("unexpected nullable type: %#v", got["type"])
+	}
+}
+
+// TestGenaiSchemaToMapNullableAnyOf verifies that a nullable schema whose
+// only constraint is an anyOf is wrapped as {"anyOf":[<original schema>,
+// {"type":"null"}]}, the same general representation used for enum: the
+// complete original (non-null) schema becomes one branch, sitting alongside
+// a null branch, rather than merely appending a null branch into the
+// original anyOf list in place.
+func TestGenaiSchemaToMapNullableAnyOf(t *testing.T) {
+	t.Parallel()
+
+	nullable := true
+	got := genaiSchemaToMap(&genai.Schema{
+		Nullable: &nullable,
+		AnyOf: []*genai.Schema{
+			{Type: genai.TypeString},
+			{Type: genai.TypeInteger},
+		},
+	})
+	if _, ok := got["type"]; ok {
+		t.Fatalf("expected no top-level type for anyOf nullable schema, got %#v", got["type"])
+	}
+
+	anyOf, ok := got["anyOf"].([]map[string]any)
+	if !ok || len(anyOf) != 2 {
+		t.Fatalf("expected outer anyOf with 2 branches, got %#v", got["anyOf"])
+	}
+	if anyOf[1]["type"] != "null" {
+		t.Fatalf("expected second branch to be null, got %#v", anyOf[1])
+	}
+
+	original, ok := anyOf[0]["anyOf"].([]map[string]any)
+	if !ok || len(original) != 2 {
+		t.Fatalf("expected first branch to keep the original anyOf, got %#v", anyOf[0])
+	}
+	if original[0]["type"] != "string" || original[1]["type"] != "integer" {
+		t.Fatalf("unexpected original anyOf branches: %#v", original)
+	}
+}
+
+// TestGenaiSchemaToMapNullableUntypedEnumWrapsAnyOf verifies gap (a): an
+// UNTYPED schema with enum must also validate null, by wrapping the complete
+// original schema in an outer anyOf alongside a null branch.
+func TestGenaiSchemaToMapNullableUntypedEnumWrapsAnyOf(t *testing.T) {
+	t.Parallel()
+
+	nullable := true
+	got := genaiSchemaToMap(&genai.Schema{
+		Enum:     []string{"a", "b"},
+		Nullable: &nullable,
+	})
+	if _, ok := got["type"]; ok {
+		t.Fatalf("expected no top-level type, got %#v", got["type"])
+	}
+
+	anyOf, ok := got["anyOf"].([]map[string]any)
+	if !ok || len(anyOf) != 2 {
+		t.Fatalf("expected anyOf with 2 branches, got %#v", got["anyOf"])
+	}
+	enum, ok := anyOf[0]["enum"].([]string)
+	if !ok || len(enum) != 2 {
+		t.Fatalf("expected first branch to keep enum, got %#v", anyOf[0])
+	}
+	if anyOf[1]["type"] != "null" {
+		t.Fatalf("expected second branch to be null, got %#v", anyOf[1])
+	}
+}
+
+// TestGenaiSchemaToMapNullableTypedAnyOfWrapsAnyOf verifies gap (b): a TYPED
+// schema that also has anyOf must wrap the complete schema (type and anyOf
+// together) rather than merely widening "type" in place, which would still
+// leave null failing the anyOf branch match.
+func TestGenaiSchemaToMapNullableTypedAnyOfWrapsAnyOf(t *testing.T) {
+	t.Parallel()
+
+	nullable := true
+	got := genaiSchemaToMap(&genai.Schema{
+		Type:     genai.TypeString,
+		Nullable: &nullable,
+		AnyOf: []*genai.Schema{
+			{Type: genai.TypeString},
+			{Type: genai.TypeInteger},
+		},
+	})
+	if _, ok := got["type"]; ok {
+		t.Fatalf("expected no top-level type when wrapped in anyOf, got %#v", got["type"])
+	}
+
+	anyOf, ok := got["anyOf"].([]map[string]any)
+	if !ok || len(anyOf) != 2 {
+		t.Fatalf("expected outer anyOf with 2 branches, got %#v", got["anyOf"])
+	}
+	if anyOf[0]["type"] != "string" {
+		t.Fatalf("expected first branch to keep type=string, got %#v", anyOf[0])
+	}
+	if _, ok := anyOf[0]["anyOf"]; !ok {
+		t.Fatalf("expected first branch to keep the original anyOf, got %#v", anyOf[0])
+	}
+	if anyOf[1]["type"] != "null" {
+		t.Fatalf("expected second branch to be null, got %#v", anyOf[1])
 	}
 }
 
@@ -410,6 +594,31 @@ func TestFunctionFromDeclarationEmptyName(t *testing.T) {
 	}
 }
 
+func TestNormalizeSchemaFromDeclarationBothSet(t *testing.T) {
+	t.Parallel()
+
+	_, err := normalizeSchemaFromDeclaration(
+		map[string]any{"type": "object"},
+		&genai.Schema{Type: genai.TypeObject},
+	)
+	if err == nil {
+		t.Fatal("expected error when both parameters and parametersJsonSchema are set")
+	}
+}
+
+func TestFunctionFromDeclarationRejectsBothParameterSchemas(t *testing.T) {
+	t.Parallel()
+
+	_, err := functionFromDeclaration("weather", &genai.FunctionDeclaration{
+		Name:                 "get_weather",
+		Parameters:           &genai.Schema{Type: genai.TypeObject},
+		ParametersJsonSchema: map[string]any{"type": "object"},
+	})
+	if err == nil {
+		t.Fatal("expected error when both parameters and parametersJsonSchema are set")
+	}
+}
+
 func TestNormalizeSchemaFromDeclarationNil(t *testing.T) {
 	t.Parallel()
 
@@ -449,5 +658,160 @@ func TestJsonRawMessageToMapInvalid(t *testing.T) {
 	_, err := jsonRawMessageToMap(json.RawMessage(`{invalid}`))
 	if err == nil {
 		t.Fatal("expected invalid json error")
+	}
+}
+
+// TestNormalizeSchemaFromDeclarationTypedNilJSONSchemaIgnored verifies that a
+// typed-nil ParametersJsonSchema (e.g. a nil *jsonschema.Schema boxed into
+// the any parameter) is treated as absent rather than "set", so it does not
+// wrongly trip the mutually-exclusive check against a real Parameters schema.
+func TestNormalizeSchemaFromDeclarationTypedNilJSONSchemaIgnored(t *testing.T) {
+	t.Parallel()
+
+	var typedNilJSONSchema *jsonschema.Schema
+
+	got, err := normalizeSchemaFromDeclaration(typedNilJSONSchema, &genai.Schema{
+		Type: genai.TypeObject,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got["type"] != "object" {
+		t.Fatalf("type=%#v expected object", got["type"])
+	}
+}
+
+// TestJsonRawMessageToMapRejectsNull verifies item 7: a raw JSON schema of
+// literal "null" unmarshals to a nil map without an error, which would
+// otherwise be silently treated as "no schema" and drop the caller-provided
+// parameters/response schema. It must be rejected instead.
+func TestJsonRawMessageToMapRejectsNull(t *testing.T) {
+	t.Parallel()
+
+	_, err := jsonRawMessageToMap(json.RawMessage("null"))
+	if err == nil {
+		t.Fatal("expected error for null json schema")
+	}
+}
+
+// TestNormalizeSchemaRejectsRawNull pins the same behavior through the
+// normalizeSchema entry point used for ParametersJsonSchema/response schemas.
+func TestNormalizeSchemaRejectsRawNull(t *testing.T) {
+	t.Parallel()
+
+	_, err := normalizeSchema(json.RawMessage("null"))
+	if err == nil {
+		t.Fatal("expected error for null json schema")
+	}
+}
+
+// TestFunctionFromDeclarationRejectsNonBlockingBehavior verifies item 5: a
+// populated, non-default Behavior (NON_BLOCKING) has no AnyLLM tool
+// equivalent and must be rejected rather than silently dropped.
+func TestFunctionFromDeclarationRejectsNonBlockingBehavior(t *testing.T) {
+	t.Parallel()
+
+	_, err := functionFromDeclaration("weather", &genai.FunctionDeclaration{
+		Name:     "get_weather",
+		Behavior: genai.BehaviorNonBlocking,
+	})
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+// TestFunctionFromDeclarationAcceptsBlockingBehavior verifies that
+// BehaviorBlocking, the adapter's implicit default (synchronous
+// request/response tool calling), is accepted rather than rejected.
+func TestFunctionFromDeclarationAcceptsBlockingBehavior(t *testing.T) {
+	t.Parallel()
+
+	_, err := functionFromDeclaration("weather", &genai.FunctionDeclaration{
+		Name:     "get_weather",
+		Behavior: genai.BehaviorBlocking,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error for BehaviorBlocking: %v", err)
+	}
+}
+
+// TestFunctionFromDeclarationRejectsResponse verifies item 5: a populated
+// Response schema has no AnyLLM tool equivalent and must be rejected rather
+// than silently dropped.
+func TestFunctionFromDeclarationRejectsResponse(t *testing.T) {
+	t.Parallel()
+
+	_, err := functionFromDeclaration("weather", &genai.FunctionDeclaration{
+		Name:     "get_weather",
+		Response: &genai.Schema{Type: genai.TypeObject},
+	})
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+// TestFunctionFromDeclarationRejectsResponseJsonSchema mirrors
+// TestFunctionFromDeclarationRejectsResponse for ResponseJsonSchema, and
+// uses isNilValue rather than a plain "!= nil" comparison so a typed-nil
+// value is correctly treated as absent.
+func TestFunctionFromDeclarationRejectsResponseJsonSchema(t *testing.T) {
+	t.Parallel()
+
+	schema, err := jsonschema.For[struct {
+		Result string `json:"result"`
+	}](nil)
+	if err != nil {
+		t.Fatalf("jsonschema.For failed: %v", err)
+	}
+
+	_, err = functionFromDeclaration("weather", &genai.FunctionDeclaration{
+		Name:               "get_weather",
+		ResponseJsonSchema: schema,
+	})
+	if !errors.Is(err, ErrUnsupportedFeature) {
+		t.Fatalf("expected ErrUnsupportedFeature, got %v", err)
+	}
+}
+
+// TestFunctionFromDeclarationTypedNilResponseJsonSchemaIgnored verifies that
+// a typed-nil ResponseJsonSchema (e.g. a nil *jsonschema.Schema boxed into
+// the any field) is treated as absent, not populated.
+func TestFunctionFromDeclarationTypedNilResponseJsonSchemaIgnored(t *testing.T) {
+	t.Parallel()
+
+	var typedNilJSONSchema *jsonschema.Schema
+
+	_, err := functionFromDeclaration("weather", &genai.FunctionDeclaration{
+		Name:               "get_weather",
+		ResponseJsonSchema: typedNilJSONSchema,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error for typed-nil ResponseJsonSchema: %v", err)
+	}
+}
+
+// nilDeclarerTool implements functionDeclarer with a pointer receiver whose
+// method dereferences the receiver, so a typed-nil value panics if called
+// without a nil guard.
+type nilDeclarerTool struct {
+	decl *genai.FunctionDeclaration
+}
+
+func (t *nilDeclarerTool) Declaration() *genai.FunctionDeclaration {
+	return t.decl
+}
+
+// TestConvertToolsTypedNilDeclarerReturnsErrorInsteadOfPanicking verifies
+// item 9: a typed-nil functionDeclarer (non-nil as an interface value, since
+// it wraps a nil *nilDeclarerTool) must be rejected with a validation error
+// rather than panicking when Declaration() dereferences the nil receiver.
+func TestConvertToolsTypedNilDeclarerReturnsErrorInsteadOfPanicking(t *testing.T) {
+	t.Parallel()
+
+	var nilTool *nilDeclarerTool
+
+	_, err := convertTools(map[string]any{"weather": nilTool})
+	if err == nil {
+		t.Fatal("expected error for typed-nil tool declarer")
 	}
 }

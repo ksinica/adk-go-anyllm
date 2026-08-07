@@ -53,6 +53,25 @@ func TestWithExtraNilClearsExtra(t *testing.T) {
 	}
 }
 
+func TestWithExtraReplacesPriorMap(t *testing.T) {
+	t.Parallel()
+
+	m, err := New(
+		&fakeProvider{},
+		WithExtra(map[string]any{"foo": "bar"}),
+		WithExtra(map[string]any{"baz": "qux"}),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := m.extra["foo"]; ok {
+		t.Fatalf("expected prior extra map to be replaced, got %#v", m.extra)
+	}
+	if m.extra["baz"] != "qux" {
+		t.Fatalf("expected replacement extra map, got %#v", m.extra)
+	}
+}
+
 func TestNewSkipsNilOption(t *testing.T) {
 	t.Parallel()
 
