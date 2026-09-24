@@ -4,7 +4,7 @@
 
 **One adapter. Every model. Zero lock-in.**
 
-Plug any [AnyLLM Go](https://github.com/mozilla-ai/any-llm-go) provider — OpenAI, Anthropic, Ollama, and friends — straight into [Google's Agent Development Kit for Go](https://google.golang.org/adk). `adk-go-anyllm` is a thin, faithful translation layer that implements `google.golang.org/adk/model.LLM` so your agents stop caring which vendor is behind the curtain.
+Plug any [AnyLLM Go](https://github.com/mozilla-ai/any-llm-go) provider — OpenAI, Anthropic, Ollama, and friends — straight into [Google's Agent Development Kit for Go](https://google.golang.org/adk). `adk-go-anyllm` is a thin, faithful translation layer that implements `google.golang.org/adk/v2/model.LLM` so your agents stop caring which vendor is behind the curtain.
 
 Write your agent once. Swap the model whenever you like.
 
@@ -17,6 +17,10 @@ Write your agent once. Swap the model whenever you like.
 - **Tiny surface area.** One required argument, two options, one constructor. That's the whole API.
 
 ## Quickstart
+
+Requires **Go 1.26.6+** and **ADK v2**. Use
+`google.golang.org/adk/v2/...` imports (for example,
+`google.golang.org/adk/v2/agent/llmagent`); ADK v1 model types are not compatible.
 
 ```go
 // Pick any AnyLLM provider.
